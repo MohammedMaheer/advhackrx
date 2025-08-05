@@ -11,6 +11,20 @@ import io
 import os
 from datetime import datetime
 import uuid
+import hashlib
+import re
+import asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from db import QueryLog, Base
+from init_db import init_db
+
+# Load environment variables from .env if present (for local dev)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Initialize app and API router with prefix
 app = FastAPI(title="HackRX LLM API", version="1.0.0")
@@ -18,6 +32,8 @@ router = APIRouter(prefix="/api/v1")
 
 # Security
 security = HTTPBearer()
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+INDEX_NAME = os.getenv("PINECONE_INDEX", "pdf")
 PINECONE_API_KEY = "pcsk_7B3Z93_8WBKxheRs5H22N8LeMJTCWzjPR1wUZKE8oUJzHDyhMot6qbZ1JrfSkKM7kcLVu7"
 INDEX_NAME = "pdf"
 
@@ -29,7 +45,12 @@ class HackRXRequest(BaseModel):
 class HackRXResponse(BaseModel):
     answers: List[str]  # Only answer strings, per hackathon rules.
 
-API_KEY = "bfb8fabaf1ce137c1402366fb3d5a052836234c1ff376c326842f52e3164cc33"
+API_KEY = os.getenv("HACKRX_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX = os.getenv("PINECONE_INDEX", "pdf")
+PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east1-gcp")
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
@@ -236,11 +257,16 @@ def process_questions_with_model(document_text: str, questions: List[str]) -> Li
 
 from db import SessionLocal, QueryLog, init_db
 import asyncio
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-# Route definitions under router
-@router.post("/hackrx/run", response_model=HackRXResponse)
-async def hackrx_run(request: HackRXRequest, authorization: str = Header(None)):
-    if authorization != f"Bearer {API_KEY}":
+security = HTTPBearer()
+
+@router.post("/api/v1/hackrx/run", response_model=HackRXResponse)
+async def hackrx_run(request: HackRXRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    print(f"[DEBUG] Received Authorization header: {credentials.scheme} {credentials.credentials}")
+    print(f"[DEBUG] API_KEY from environment: {API_KEY}")
+    if credentials.scheme.lower() != "bearer" or credentials.credentials != API_KEY:
+        print("[DEBUG] Authorization failed!")
         raise HTTPException(status_code=401, detail="Unauthorized")
     document_url = request.documents
     questions = request.questions
