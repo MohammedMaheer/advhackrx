@@ -257,6 +257,10 @@ def process_questions_with_model(document_text: str, questions: List[str]) -> Li
 
 from db import SessionLocal, QueryLog, init_db
 import asyncio
+
+@app.on_event("startup")
+async def on_startup():
+    await init_db()
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 security = HTTPBearer()
