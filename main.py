@@ -3,7 +3,7 @@ import numpy as np
 import cohere
 import requests
 from pinecone import Pinecone, ServerlessSpec  # v3 import
-from fastapi import FastAPI, HTTPException, Depends, status, APIRouter
+from fastapi import FastAPI, HTTPException, Depends, Request, status, APIRouter, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List
