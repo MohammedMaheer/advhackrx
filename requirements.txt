@@ -7,5 +7,6 @@ pinecone[grpc]==3.0.0
 python-multipart==0.0.6
 sqlalchemy
 asyncpg
-openai
+openai>=3.0.0
 python-dotenv
+typing-extensions>=4.7

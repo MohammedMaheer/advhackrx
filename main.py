@@ -1,6 +1,6 @@
 import fitz
 import requests
-import openai
+from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec  # v3 import
 from fastapi import FastAPI, HTTPException, Depends, Request, status, APIRouter, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -79,9 +79,17 @@ def extract_text_from_pdf_url(pdf_url: str) -> str:
 
 # Cohere removed: OpenAI is the sole LLM provider
 
-# Configure OpenAI
+# Configure OpenAI (new SDK client) with optional Org/Project
+OPENAI_ORG = os.getenv("OPENAI_ORG")
+OPENAI_PROJECT = os.getenv("OPENAI_PROJECT")
+client_kwargs = {}
 if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+    client_kwargs["api_key"] = OPENAI_API_KEY
+if OPENAI_ORG:
+    client_kwargs["organization"] = OPENAI_ORG
+if OPENAI_PROJECT:
+    client_kwargs["project"] = OPENAI_PROJECT
+client = OpenAI(**client_kwargs)
 
 # Initialize Pinecone (v3 style)
 def init_pinecone(index_name, api_key, dim):
@@ -136,7 +144,7 @@ def ask_openai(query, context_chunks):
             timeout=20,
         )
         print(f"[DEBUG] Answer generated with model: {used_model}")
-        answer = resp["choices"][0]["message"]["content"].strip()
+        answer = resp.choices[0].message.content.strip()
         if not answer or answer.lower().startswith("not found"):
             print("[DEBUG] OpenAI returned no confident answer.")
         return answer
@@ -207,8 +215,8 @@ def get_openai_embedding(text: str, model: str = "text-embedding-3-small"):
         candidates.append("text-embedding-3-small")
     for m in candidates:
         try:
-            resp = openai.Embedding.create(model=m, input=text)
-            return resp["data"][0]["embedding"]
+            resp = client.embeddings.create(model=m, input=text)
+            return resp.data[0].embedding
         except Exception as e:
             print(f"[WARN] Embedding failed for {m}: {e}")
             continue
@@ -222,8 +230,8 @@ def embed_texts(texts: list, model: str = "text-embedding-3-small"):
         candidates.append("text-embedding-3-small")
     for m in candidates:
         try:
-            resp = openai.Embedding.create(model=m, input=texts)
-            return [d["embedding"] for d in resp["data"]]
+            resp = client.embeddings.create(model=m, input=texts)
+            return [d.embedding for d in resp.data]
         except Exception as e:
             print(f"[WARN] Batch Embedding failed for {m}: {e}")
             continue
@@ -234,7 +242,7 @@ def embed_texts(texts: list, model: str = "text-embedding-3-small"):
 def chat_completion_with_fallback(model_candidates: list, messages: list, **kwargs):
     for m in model_candidates:
         try:
-            resp = openai.ChatCompletion.create(model=m, messages=messages, **kwargs)
+            resp = client.chat.completions.create(model=m, messages=messages, **kwargs)
             return resp, m
         except Exception as e:
             print(f"[WARN] ChatCompletion failed for {m}: {e}")
@@ -297,7 +305,7 @@ def rerank_with_openai(question: str, chunk_texts: list, max_return: int = 5):
             temperature=0.0,
         )
         print(f"[DEBUG] Rerank generated with model: {used_model}")
-        text = resp["choices"][0]["message"]["content"].strip()
+        text = resp.choices[0].message.content.strip()
         ids = []
         for part in text.replace("\n", ",").split(','):
             part = part.strip()
