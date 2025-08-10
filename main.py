@@ -1,7 +1,6 @@
 import fitz
-import numpy as np
-import cohere
 import requests
+import openai
 from pinecone import Pinecone, ServerlessSpec  # v3 import
 from fastapi import FastAPI, HTTPException, Depends, Request, status, APIRouter, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -14,10 +13,7 @@ import uuid
 import hashlib
 import re
 import asyncio
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
-from db import QueryLog, Base
-from init_db import init_db
+# (SQLAlchemy and DB imports moved to bottom where SessionLocal/init_db are used)
 
 # Load environment variables from .env if present (for local dev)
 try:
@@ -34,8 +30,6 @@ router = APIRouter(prefix="/api/v1")
 security = HTTPBearer()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME = os.getenv("PINECONE_INDEX", "pdf")
-PINECONE_API_KEY = "pcsk_7B3Z93_8WBKxheRs5H22N8LeMJTCWzjPR1wUZKE8oUJzHDyhMot6qbZ1JrfSkKM7kcLVu7"
-INDEX_NAME = "pdf"
 
 # Request/Response Models
 class HackRXRequest(BaseModel):
@@ -46,11 +40,21 @@ class HackRXResponse(BaseModel):
     answers: List[str]  # Only answer strings, per hackathon rules.
 
 API_KEY = os.getenv("HACKRX_API_KEY")
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX = os.getenv("PINECONE_INDEX", "pdf")
-PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east1-gcp")
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east-1")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")  # 1536 dims
+# Configurable LLM models
+ANSWER_MODEL = os.getenv("ANSWER_MODEL", "gpt-4")
+RERANK_MODEL = os.getenv("RERANK_MODEL", "gpt-4")
+OLD_PINECONE_INDEX = os.getenv("OLD_PINECONE_INDEX", "")
+
+def embedding_dim_for_model(model: str) -> int:
+    # Known OpenAI embedding dims
+    if model == "text-embedding-3-large":
+        return 3072
+    # default
+    return 1536
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
@@ -73,10 +77,73 @@ def extract_text_from_pdf_url(pdf_url: str) -> str:
     return text
 
 
-# Initialize Cohere Client
-co = cohere.Client("ba9VI3VW1sXTxyIKhOZHWPA3326tAQzHGVVQ16aI")
+# Cohere removed: OpenAI is the sole LLM provider
 
-import hashlib
+# Configure OpenAI
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+
+# Initialize Pinecone (v3 style)
+def init_pinecone(index_name, api_key, dim):
+    pc = Pinecone(api_key=api_key)
+    region = os.getenv("PINECONE_REGION", "us-east-1")
+    names = pc.list_indexes().names()
+    if index_name not in names:
+        print(f"Creating index: {index_name} in region {region} with dimension {dim}")
+        pc.create_index(
+            name=index_name,
+            dimension=dim,
+            metric="cosine",
+            spec=ServerlessSpec(cloud='aws', region=region)
+        )
+        print(f"Index {index_name} created successfully")
+    else:
+        try:
+            desc = pc.describe_index(index_name)
+            existing_dim = desc.get("dimension") or desc.get("spec", {}).get("dimension")
+            if existing_dim and existing_dim != dim:
+                print(f"[ERROR] Pinecone index '{index_name}' dimension {existing_dim} != required {dim}. Change PINECONE_INDEX or recreate index.")
+        except Exception as e:
+            print(f"[WARN] Could not describe Pinecone index: {e}")
+    return pc.Index(index_name)
+
+try:
+    index = init_pinecone(INDEX_NAME, PINECONE_API_KEY, embedding_dim_for_model(EMBEDDING_MODEL))
+    print(f"Connected to Pinecone index: {INDEX_NAME}")
+except Exception as e:
+    print(f"Pinecone connection error: {e}")
+    index = None
+
+def ask_openai(query, context_chunks):
+    # Use top-5 most relevant chunks, up to 120 words each
+    context = "\n\n".join([" ".join(chunk.split()[:120]) for chunk in context_chunks[:5]])
+    prompt = (
+        "You are an expert assistant. Only answer using the provided PDF context. "
+        "If the answer is not in the context, say 'Not found in the document.' "
+        "Answer concisely and accurately, in one sentence.\n"
+        f"Context:\n{context}\n\nQuestion: {query}"
+    )
+    try:
+        messages = [
+            {"role": "system", "content": "You answer strictly from the PDF context, never guessing, never citing, never inventing."},
+            {"role": "user", "content": prompt}
+        ]
+        resp, used_model = chat_completion_with_fallback(
+            [ANSWER_MODEL, "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
+            messages,
+            max_tokens=80,
+            temperature=0.0,
+            timeout=20,
+        )
+        print(f"[DEBUG] Answer generated with model: {used_model}")
+        answer = resp["choices"][0]["message"]["content"].strip()
+        if not answer or answer.lower().startswith("not found"):
+            print("[DEBUG] OpenAI returned no confident answer.")
+        return answer
+    except Exception as e:
+        print("[ERROR] OpenAI API error:", e)
+        return "Error: Unable to generate answer"
+
 import re
 
 def chunk_text_by_section(text):
@@ -106,69 +173,151 @@ def chunk_text_by_section(text):
     return chunks
 
 
-# Initialize Pinecone (v3 style)
-def init_pinecone(index_name, api_key):
-    pc = Pinecone(api_key=api_key)
-    if index_name not in pc.list_indexes().names():
-        print(f"Creating index: {index_name}")
-        pc.create_index(
-            name=index_name,
-            dimension=1024,
-            metric="cosine",
-            spec=ServerlessSpec(cloud='aws', region='us-east-1')
-        )
-        print(f"Index {index_name} created successfully")
-    return pc.Index(index_name)
-
-try:
-    index = init_pinecone(INDEX_NAME, PINECONE_API_KEY)
-    print(f"Connected to Pinecone index: {INDEX_NAME}")
-except Exception as e:
-    print(f"Pinecone connection error: {e}")
-    index = None
-
-def ask_perplexity(query, context_chunks):
-    api_key = "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"
-    url = "https://api.perplexity.ai/chat/completions"
-    short_chunks = [" ".join(chunk.split()[:100]) for chunk in context_chunks]
-    context_text = "\n\n".join(short_chunks)
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "sonar",
-        "messages": [
-            {"role": "system", "content": "Strictly answer the user's question in only one sentence. Do not provide explanations or extra information and dont cite your answers"},
-            {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"}
-        ]
-    }
-    response = requests.post(url, headers=headers, json=payload)
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
-        print("Error:", response.status_code, response.text)
-        return None
+# Removed legacy Pinecone initializer (used wrong dimension)
 
 import re
 
-def fallback_chunk_text(text, chunk_size=100):
-    # Split by sentences, then group into chunks of ~chunk_size words
+def fallback_chunk_text(text, chunk_size=180, overlap=60):
+    """
+    Overlapping sentence-grouped chunks for better boundary context.
+    chunk_size/overlap measured in words.
+    """
     sentences = re.split(r'(?<=[.!?]) +', text)
+    words = []
+    for s in sentences:
+        words.extend(s.split())
     chunks = []
-    current = []
-    count = 0
-    for sent in sentences:
-        words = sent.split()
-        count += len(words)
-        current.append(sent)
-        if count >= chunk_size:
-            chunks.append(' '.join(current))
-            current = []
-            count = 0
-    if current:
-        chunks.append(' '.join(current))
+    start = 0
+    n = len(words)
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunk_words = words[start:end]
+        if chunk_words:
+            chunks.append(' '.join(chunk_words))
+        if end == n:
+            break
+        start = max(end - overlap, start + 1)
     return chunks
+
+# --- Embedding and selection utilities (OpenAI-based, runtime only) ---
+def get_openai_embedding(text: str, model: str = "text-embedding-3-small"):
+    """Get a single embedding with fallback to smaller model if needed."""
+    candidates = [model]
+    if model != "text-embedding-3-small":
+        candidates.append("text-embedding-3-small")
+    for m in candidates:
+        try:
+            resp = openai.Embedding.create(model=m, input=text)
+            return resp["data"][0]["embedding"]
+        except Exception as e:
+            print(f"[WARN] Embedding failed for {m}: {e}")
+            continue
+    print("[ERROR] All embedding fallbacks failed")
+    return None
+
+def embed_texts(texts: list, model: str = "text-embedding-3-small"):
+    """Batch embeddings with fallback to smaller model if primary fails."""
+    candidates = [model]
+    if model != "text-embedding-3-small":
+        candidates.append("text-embedding-3-small")
+    for m in candidates:
+        try:
+            resp = openai.Embedding.create(model=m, input=texts)
+            return [d["embedding"] for d in resp["data"]]
+        except Exception as e:
+            print(f"[WARN] Batch Embedding failed for {m}: {e}")
+            continue
+    print("[ERROR] All batch embedding fallbacks failed")
+    return [None] * len(texts)
+
+# --- ChatCompletion fallback utility ---
+def chat_completion_with_fallback(model_candidates: list, messages: list, **kwargs):
+    for m in model_candidates:
+        try:
+            resp = openai.ChatCompletion.create(model=m, messages=messages, **kwargs)
+            return resp, m
+        except Exception as e:
+            print(f"[WARN] ChatCompletion failed for {m}: {e}")
+            continue
+    raise RuntimeError("All ChatCompletion fallbacks failed")
+
+def cosine(u, v):
+    import math
+    if u is None or v is None:
+        return -1.0
+    dot = sum(a*b for a, b in zip(u, v))
+    nu = math.sqrt(sum(a*a for a in u))
+    nv = math.sqrt(sum(b*b for b in v))
+    if nu == 0 or nv == 0:
+        return -1.0
+    return dot / (nu * nv)
+
+def mmr_select(query_vec, doc_vecs, k=8, lambda_coef=0.7):
+    selected = []
+    candidates = list(range(len(doc_vecs)))
+    while candidates and len(selected) < k:
+        best_idx = None
+        best_score = -1e9
+        for i in candidates:
+            rel = cosine(query_vec, doc_vecs[i])
+            div = 0.0
+            if selected:
+                div = max(cosine(doc_vecs[i], doc_vecs[j]) for j in selected)
+            score = lambda_coef * rel - (1 - lambda_coef) * div
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        selected.append(best_idx)
+        candidates.remove(best_idx)
+    return selected
+
+def rerank_with_openai(question: str, chunk_texts: list, max_return: int = 5):
+    """Ask OpenAI to pick the most relevant chunk IDs. Returns list of indices."""
+    if not chunk_texts:
+        return []
+    items = []
+    for i, t in enumerate(chunk_texts):
+        # keep each chunk concise
+        items.append(f"ID:{i} -> {t[:500]}")
+    rerank_prompt = (
+        "You will be given a question and a list of chunked passages with IDs. "
+        "Select the top passages most relevant to answering the question. "
+        "Return only a comma-separated list of IDs in descending order of relevance, no extra text.\n\n"
+        f"Question: {question}\nPassages:\n" + "\n".join(items)
+    )
+    try:
+        messages = [
+            {"role": "system", "content": "You are a ranking assistant."},
+            {"role": "user", "content": rerank_prompt}
+        ]
+        resp, used_model = chat_completion_with_fallback(
+            [RERANK_MODEL, "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
+            messages,
+            max_tokens=50,
+            temperature=0.0,
+        )
+        print(f"[DEBUG] Rerank generated with model: {used_model}")
+        text = resp["choices"][0]["message"]["content"].strip()
+        ids = []
+        for part in text.replace("\n", ",").split(','):
+            part = part.strip()
+            if part.startswith("ID:"):
+                part = part[3:].strip()
+            if part.isdigit():
+                idx = int(part)
+                if 0 <= idx < len(chunk_texts):
+                    ids.append(idx)
+        # unique and cap
+        seen = set()
+        ordered = []
+        for idx in ids:
+            if idx not in seen:
+                seen.add(idx)
+                ordered.append(idx)
+        return ordered[:max_return]
+    except Exception as e:
+        print(f"[ERROR] OpenAI rerank error: {e}")
+        return list(range(min(max_return, len(chunk_texts))))
 
 def process_questions_with_model(document_text: str, questions: List[str]) -> List[dict]:
     """
@@ -189,7 +338,7 @@ def process_questions_with_model(document_text: str, questions: List[str]) -> Li
         # Fallback if only one chunk (likely bad chunking)
         if len(chunk_texts) <= 1:
             print("[DEBUG] Fallback: chunking by sentences/words.")
-            chunk_texts = fallback_chunk_text(document_text)
+            chunk_texts = fallback_chunk_text(document_text, chunk_size=180)  # Larger chunks for more context
             print(f"[DEBUG] Number of fallback chunks: {len(chunk_texts)}")
             if chunk_texts:
                 print(f"[DEBUG] First fallback chunk: {chunk_texts[0][:200]}")
@@ -201,13 +350,8 @@ def process_questions_with_model(document_text: str, questions: List[str]) -> Li
         print(f"[DEBUG] Pinecone index stats for namespace '{doc_hash}': {namespace_stats}")
         already_embedded = vector_count > 0
         if not already_embedded:
-            response = co.embed(
-                texts=chunk_texts,
-                model="embed-english-v3.0",
-                input_type="search_document"
-            )
-            embeddings = response.embeddings
-            print(f"[DEBUG] Embeddings shape: {len(embeddings)} x {len(embeddings[0]) if embeddings else 0}")
+            embeddings = embed_texts(chunk_texts, model=EMBEDDING_MODEL)
+            print(f"[DEBUG] OpenAI embeddings shape: {len(embeddings)} x {len(embeddings[0]) if embeddings and embeddings[0] else 0}")
             print(f"[DEBUG] Using namespace for upsert: {doc_hash}")
             pinecone_vectors = [
                 (f"{doc_hash}-{i}", vec, {"text": chunk_texts[i], "section": section_chunks[i][0]}) 
@@ -219,27 +363,34 @@ def process_questions_with_model(document_text: str, questions: List[str]) -> Li
             print(f"[DEBUG] Pinecone index stats after upsert: {stats}")
             print(f"[DEBUG] Upserted {len(pinecone_vectors)} vectors to Pinecone namespace {doc_hash}")
         answers = []
-        for idx, question in enumerate(questions):
+        for i, question in enumerate(questions):
             try:
                 print(f"[DEBUG] Querying Pinecone for question: {question}")
-                query_response = co.embed(
-                    texts=[question],
-                    model="embed-english-v3.0",
-                    input_type="search_query"
-                )
-                query_vec = query_response.embeddings[0]
+                query_vec = get_openai_embedding(question, model=EMBEDDING_MODEL)
                 print(f"[DEBUG] Query vector dimension: {len(query_vec)}. Using namespace: {doc_hash}")
                 results = index.query(
                     vector=query_vec, 
-                    top_k=3,  # Retrieve top-3 relevant chunks
+                    top_k=20,  # Retrieve more candidates for MMR and rerank
                     include_metadata=True,
                     namespace=doc_hash
                 )
-                if idx == 0:
+                if i == 0:
                     print(f"[DEBUG] Pinecone results for first question: {results}")
-                context_chunks = [match['metadata']['text'] for match in results['matches']]
-                matched_sections = [match['metadata'].get('section', '') for match in results['matches']]
-                answer = ask_perplexity(question, context_chunks)
+                # Candidate chunks
+                candidate_texts = [m['metadata']['text'] for m in results['matches']]
+                matched_sections = [m['metadata'].get('section', '') for m in results['matches']]
+                # Embed query and candidates with OpenAI for MMR selection
+                oq = get_openai_embedding(question)
+                odocs = embed_texts(candidate_texts)
+                if oq is not None and any(v is not None for v in odocs):
+                    mmr_idx = mmr_select(oq, odocs, k=8, lambda_coef=0.7)
+                    mmr_chunks = [candidate_texts[j] for j in mmr_idx]
+                else:
+                    mmr_chunks = candidate_texts[:8]
+                # LLM rerank to choose final top-5
+                order = rerank_with_openai(question, mmr_chunks, max_return=5)
+                context_chunks = [mmr_chunks[j] for j in order]
+                answer = ask_openai(question, context_chunks)
                 rationale = f"Matched sections: {matched_sections}. Context used: {context_chunks}"
                 answers.append({
                     "answer": answer if answer else "Unable to generate answer",
@@ -261,14 +412,10 @@ import asyncio
 @app.on_event("startup")
 async def on_startup():
     await init_db()
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-security = HTTPBearer()
-
-@router.post("/api/v1/hackrx/run", response_model=HackRXResponse)
+@router.post("/hackrx/run", response_model=HackRXResponse)
 async def hackrx_run(request: HackRXRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    print(f"[DEBUG] Received Authorization header: {credentials.scheme} {credentials.credentials}")
-    print(f"[DEBUG] API_KEY from environment: {API_KEY}")
+    # Avoid logging secrets or full Authorization headers in production
     if credentials.scheme.lower() != "bearer" or credentials.credentials != API_KEY:
         print("[DEBUG] Authorization failed!")
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -293,6 +440,24 @@ async def health_check():
 @router.get("/")
 async def root():
     return {"message": "HackRX LLM API is running"}
+
+# Admin endpoint: delete an old Pinecone index (use with caution). Protected by same Bearer token.
+@router.post("/admin/pinecone/delete-index")
+async def delete_old_index(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.scheme.lower() != "bearer" or credentials.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not OLD_PINECONE_INDEX:
+        raise HTTPException(status_code=400, detail="OLD_PINECONE_INDEX not set")
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        names = pc.list_indexes().names()
+        if OLD_PINECONE_INDEX in names:
+            pc.delete_index(OLD_PINECONE_INDEX)
+            return {"deleted": OLD_PINECONE_INDEX}
+        else:
+            return {"message": f"Index '{OLD_PINECONE_INDEX}' not found", "available": names}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete index: {e}")
 
 # Include router
 app.include_router(router)

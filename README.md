@@ -5,7 +5,7 @@ This project is a production-ready, hackathon-compliant API for answering natura
 
 - **Backend:** FastAPI
 - **Vector DB:** Pinecone
-- **LLM:** GPT-4 (or Cohere/Perplexity for demo)
+- **LLM:** OpenAI GPT-4/GPT-4o (OpenAI-only)
 - **DB:** PostgreSQL (async, for logging/analytics)
 - **Deployment:** Ready for Heroku, Vercel, Railway, Render, AWS, etc.
 - **API Auth:** Bearer token
@@ -22,7 +22,7 @@ This project is a production-ready, hackathon-compliant API for answering natura
 ## API Usage
 ### Endpoint
 ```
-POST /hackrx/run
+POST /api/v1/hackrx/run
 ```
 
 ### Authentication
@@ -33,7 +33,7 @@ Authorization: Bearer <api_key>
 
 ### Request Example
 ```
-POST /hackrx/run
+POST /api/v1/hackrx/run
 Content-Type: application/json
 Authorization: Bearer <api_key>
 {
@@ -69,9 +69,20 @@ Authorization: Bearer <api_key>
    ```
 4. **Deploy to Heroku/Vercel/Railway/Render** (see platform docs)
 
+### Required environment variables
+- `HACKRX_API_KEY` (Bearer token)
+- `OPENAI_API_KEY`
+- `PINECONE_API_KEY`
+- `PINECONE_INDEX` (e.g., `hackrx-llm-index-oai-3072`)
+- `PINECONE_REGION` (e.g., `us-east-1`)
+- `EMBEDDING_MODEL` (e.g., `text-embedding-3-large`)
+- `ANSWER_MODEL` (e.g., `gpt-4o`)
+- `RERANK_MODEL` (e.g., `gpt-4o`)
+- `DATABASE_URL` (PostgreSQL, asyncpg driver)
+
 ## Hackathon Compliance
 - **PDF only** (no DOCX/email)
-- **POST /hackrx/run** endpoint, Bearer token auth
+- **POST /api/v1/hackrx/run** endpoint, Bearer token auth
 - **Returns only `answers` list** (no rationale/matched_text)
 - **Responds in <30s**
 - **Ready for HTTPS/public deployment**
