@@ -351,12 +351,19 @@ def process_questions_with_model(document_text: str, questions: List[str]) -> Li
         already_embedded = vector_count > 0
         if not already_embedded:
             embeddings = embed_texts(chunk_texts, model=EMBEDDING_MODEL)
-            print(f"[DEBUG] OpenAI embeddings shape: {len(embeddings)} x {len(embeddings[0]) if embeddings and embeddings[0] else 0}")
+            if not embeddings or all(v is None for v in embeddings):
+                print("[ERROR] Embedding failed for all chunks; aborting upsert.")
+                return [{"answer": "Embedding failed; check OPENAI_API_KEY and model/quotas", "matched_text": "", "rationale": ""}] * len(questions)
+            print(f"[DEBUG] Embeddings generated for {len(embeddings)} chunks (non-None: {sum(1 for v in embeddings if v is not None)})")
             print(f"[DEBUG] Using namespace for upsert: {doc_hash}")
-            pinecone_vectors = [
-                (f"{doc_hash}-{i}", vec, {"text": chunk_texts[i], "section": section_chunks[i][0]}) 
-                for i, vec in enumerate(embeddings)
-            ]
+            pinecone_vectors = []
+            for i, vec in enumerate(embeddings):
+                if vec is None:
+                    continue
+                pinecone_vectors.append((f"{doc_hash}-{i}", vec, {"text": chunk_texts[i], "section": section_chunks[i][0]}))
+            if not pinecone_vectors:
+                print("[ERROR] No valid vectors to upsert after filtering.")
+                return [{"answer": "No valid vectors to upsert; embeddings failed", "matched_text": "", "rationale": ""}] * len(questions)
             upsert_response = index.upsert(vectors=pinecone_vectors, namespace=doc_hash)
             print(f"[DEBUG] Pinecone upsert response: {upsert_response}")
             stats = index.describe_index_stats()
@@ -367,6 +374,10 @@ def process_questions_with_model(document_text: str, questions: List[str]) -> Li
             try:
                 print(f"[DEBUG] Querying Pinecone for question: {question}")
                 query_vec = get_openai_embedding(question, model=EMBEDDING_MODEL)
+                if query_vec is None:
+                    print("[ERROR] Query embedding failed; returning fallback answer.")
+                    answers.append({"answer": "Unable to embed query; please retry", "matched_text": "", "rationale": ""})
+                    continue
                 print(f"[DEBUG] Query vector dimension: {len(query_vec)}. Using namespace: {doc_hash}")
                 results = index.query(
                     vector=query_vec, 
@@ -382,8 +393,13 @@ def process_questions_with_model(document_text: str, questions: List[str]) -> Li
                 # Embed query and candidates with OpenAI for MMR selection
                 oq = get_openai_embedding(question)
                 odocs = embed_texts(candidate_texts)
-                if oq is not None and any(v is not None for v in odocs):
-                    mmr_idx = mmr_select(oq, odocs, k=8, lambda_coef=0.7)
+                # filter out None embeddings and keep mapping
+                filtered = [(j, v) for j, v in enumerate(odocs) if v is not None]
+                if oq is not None and filtered:
+                    idx_map = [j for j, _ in filtered]
+                    vecs = [v for _, v in filtered]
+                    mmr_rel_idx = mmr_select(oq, vecs, k=min(8, len(vecs)), lambda_coef=0.7)
+                    mmr_idx = [idx_map[j] for j in mmr_rel_idx]
                     mmr_chunks = [candidate_texts[j] for j in mmr_idx]
                 else:
                     mmr_chunks = candidate_texts[:8]
