@@ -435,7 +435,16 @@ import asyncio
 
 @app.on_event("startup")
 async def on_startup():
-    await init_db()
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if not db_url:
+        print("[WARN] DATABASE_URL not set; skipping DB initialization (local mode).")
+        return
+    try:
+        await init_db()
+        print("[DEBUG] Database initialized successfully.")
+    except Exception as e:
+        # Do not crash the app locally; log and continue so diagnostics can run
+        print(f"[WARN] Database initialization failed: {e}. Continuing without DB.")
 
 @router.post("/hackrx/run", response_model=HackRXResponse)
 async def hackrx_run(request: HackRXRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -449,12 +458,25 @@ async def hackrx_run(request: HackRXRequest, credentials: HTTPAuthorizationCrede
     answers_full = process_questions_with_model(document_text, questions)
     # Only return answer strings per hackathon rules
     answers = [a["answer"] if isinstance(a, dict) else str(a) for a in answers_full]
-    # Log to DB (keep full info for analytics)
-    async with SessionLocal() as session:
-        for q, a_full in zip(questions, answers_full):
-            log = QueryLog(document_url=document_url, question=q, answer=a_full.get("answer", ""), matched_text=str(a_full.get("matched_text", "")), rationale=a_full.get("rationale", ""))
-            session.add(log)
-        await session.commit()
+    # Log to DB (keep full info for analytics) only if DATABASE_URL is configured
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if db_url:
+        try:
+            async with SessionLocal() as session:
+                for q, a_full in zip(questions, answers_full):
+                    log = QueryLog(
+                        document_url=document_url,
+                        question=q,
+                        answer=a_full.get("answer", ""),
+                        matched_text=str(a_full.get("matched_text", "")),
+                        rationale=a_full.get("rationale", ""),
+                    )
+                    session.add(log)
+                await session.commit()
+        except Exception as e:
+            print(f"[WARN] Skipping DB logging due to error: {e}")
+    else:
+        print("[WARN] DATABASE_URL not set; skipping DB logging.")
     return HackRXResponse(answers=answers)
 
 @router.get("/health")
@@ -464,6 +486,32 @@ async def health_check():
 @router.get("/")
 async def root():
     return {"message": "HackRX LLM API is running"}
+
+@router.post("/diag/embed")
+async def diag_embed(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.scheme.lower() != "bearer" or credentials.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    body = await request.json()
+    text = body.get("text", "hello world")
+    model = body.get("model", EMBEDDING_MODEL)
+    try:
+        resp = client.embeddings.create(model=model, input=text)
+        return {
+            "ok": True,
+            "model": model,
+            "dim": len(resp.data[0].embedding) if resp and resp.data else None,
+            "project": OPENAI_PROJECT,
+            "org": OPENAI_ORG,
+        }
+    except Exception as e:
+        # Return the exact exception string for debugging
+        return {
+            "ok": False,
+            "model": model,
+            "project": OPENAI_PROJECT,
+            "org": OPENAI_ORG,
+            "error": str(e)
+        }
 
 # Admin endpoint: delete an old Pinecone index (use with caution). Protected by same Bearer token.
 @router.post("/admin/pinecone/delete-index")
